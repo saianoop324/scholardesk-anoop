@@ -36,3 +36,7 @@ Library data lives in `research.sqlite3`; back up this file to preserve projects
 ## Tests
 
 Run `python3 -m unittest discover -s tests -v`. Tests use a temporary database and mocked upstream API responses, so they do not need an API key.
+
+## Render deployment
+
+For a password-protected free trial deployment, follow [RENDER.md](RENDER.md). The included `render.yaml` configures the service. Render hosting uses HTTPS, its assigned hostname, and an app password. Free-hosted SQLite storage is temporary; export important research or configure persistent storage before relying on it.

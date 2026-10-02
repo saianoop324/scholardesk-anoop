@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: scholardesk
+    runtime: python
+    plan: free
+    buildCommand: python -m compileall -q server.py
+    startCommand: python server.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: SEMANTIC_SCHOLAR_API_KEY
+        sync: false
+      - key: APP_USERNAME
+        value: scholar
+      - key: APP_PASSWORD
+        sync: false

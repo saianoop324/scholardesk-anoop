@@ -43,6 +43,28 @@ class AppTests(unittest.TestCase):
         d=self.request('/api/searches',{'query':'biology','seen':['a']})
         self.assertEqual(d[0]['query'],'biology')
         self.assertEqual(self.request('/api/searches?id='+str(d[0]['id']),method='DELETE'),[])
+    def test_render_auth_and_https(self):
+        import base64
+        env={'RENDER':'true','RENDER_EXTERNAL_HOSTNAME':'scholardesk.onrender.com','APP_PASSWORD':'a-test-password-with-24-chars','APP_USERNAME':'scholar'}
+        with patch.dict(s.os.environ,env):
+            s.validate_hosting()
+            headers={'Host':'scholardesk.onrender.com','Content-Type':'application/json','Origin':'https://scholardesk.onrender.com'}
+            with self.assertRaises(urllib.error.HTTPError) as cm:self.request('/api/library',headers=headers)
+            self.assertEqual(cm.exception.code,401)
+            self.assertIn('Basic',cm.exception.headers['WWW-Authenticate'])
+            self.assertEqual(self.request('/healthz'),{'status':'ok'})
+            headers['Authorization']='Basic '+base64.b64encode(b'scholar:a-test-password-with-24-chars').decode()
+            self.assertTrue(self.request('/api/status',headers=headers)['hosted'])
+            self.request('/api/library',{'paperId':'cloud','title':'Cloud test'},headers=headers)
+            self.request('/api/library?id=cloud',method='DELETE',headers=headers)
+            headers['Origin']='https://evil.example'
+            with self.assertRaises(urllib.error.HTTPError) as cm:self.request('/api/library',{'paperId':'bad'},headers=headers)
+            self.assertEqual(cm.exception.code,403)
+    def test_render_requires_password(self):
+        with patch.dict(s.os.environ,{'RENDER':'true','RENDER_EXTERNAL_HOSTNAME':'demo.onrender.com','APP_PASSWORD':''}):
+            with self.assertRaises(ValueError):s.validate_hosting()
+            with self.assertRaises(urllib.error.HTTPError) as cm:self.request('/api/status')
+            self.assertEqual(cm.exception.code,503)
     def test_static(self):
         with urllib.request.urlopen(self.url) as r:self.assertIn(b'ScholarDesk',r.read())
 if __name__=='__main__': unittest.main()

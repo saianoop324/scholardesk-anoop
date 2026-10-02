@@ -1,24 +1,41 @@
 """Local research workspace. Python 3.11+, no third-party dependencies."""
-import json, os, sqlite3, threading, time, urllib.parse, urllib.request, urllib.error
+import base64, binascii, hmac, json, os, sqlite3, threading, time, urllib.parse, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from contextlib import contextmanager
 
 ROOT = Path(__file__).resolve().parent
 for line in (ROOT / '.env').read_text().splitlines() if (ROOT / '.env').exists() else []:
     if '=' in line and not line.strip().startswith('#'):
         k, v = line.split('=', 1)
         os.environ.setdefault(k.strip(), v.strip().strip('\"\''))
-DB = ROOT / 'research.sqlite3'
+DB = Path(os.getenv('DATABASE_PATH', str(ROOT / 'research.sqlite3')))
+
+def cloud_host():
+    return os.getenv('RENDER_EXTERNAL_HOSTNAME', '').strip().lower()
+
+def validate_hosting():
+    if os.getenv('RENDER') or cloud_host():
+        if not cloud_host():
+            raise ValueError('RENDER_EXTERNAL_HOSTNAME is required on Render.')
+        if len(os.getenv('APP_PASSWORD', '')) < 16:
+            raise ValueError('Set APP_PASSWORD to a unique password of at least 16 characters on Render.')
 FIELDS = 'title,authors,year,venue,abstract,citationCount,influentialCitationCount,openAccessPdf,url,externalIds,publicationDate'
 lock = threading.Lock()
 last_request = 0
 cache = {}
 
+@contextmanager
 def connect():
+    DB.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB)
-    db.execute('CREATE TABLE IF NOT EXISTS library (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
-    db.execute('CREATE TABLE IF NOT EXISTS searches (id INTEGER PRIMARY KEY, data TEXT NOT NULL)')
-    return db
+    try:
+        with db:
+            db.execute('CREATE TABLE IF NOT EXISTS library (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS searches (id INTEGER PRIMARY KEY, data TEXT NOT NULL)')
+            yield db
+    finally:
+        db.close()
 
 def upstream(path, params=None, body=None):
     global last_request
@@ -58,6 +75,8 @@ class Handler(BaseHTTPRequestHandler):
     def send(self, data, status=200, content_type='application/json'):
         payload = json.dumps(data).encode() if content_type == 'application/json' else data
         self.send_response(status)
+        if status == 401:
+            self.send_header('WWW-Authenticate', 'Basic realm="ScholarDesk", charset="UTF-8"')
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(payload)))
         self.send_header('X-Content-Type-Options', 'nosniff')
@@ -70,22 +89,41 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self): self.route()
     def route(self):
         try:
-            host = self.headers.get('Host','')
-            if host.split(':')[0] not in ('localhost','127.0.0.1'):
-                return self.send({'error':'Local access only.'},403)
-            if self.command != 'GET':
-                origin = self.headers.get('Origin')
-                if origin and origin != 'http://' + host: return self.send({'error':'Origin rejected.'},403)
-                if self.headers.get('Content-Type','').split(';')[0] != 'application/json': return self.send({'error':'JSON required.'},415)
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
+            if path == '/healthz' and self.command == 'GET':
+                return self.send({'status':'ok'})
+            host = self.headers.get('Host','').lower()
+            hostname = urllib.parse.urlsplit('http://' + host).hostname
+            allowed = {'localhost','127.0.0.1'}
+            if cloud_host(): allowed.add(cloud_host())
+            if hostname not in allowed:
+                return self.send({'error':'Host rejected.'},403)
+            password = os.getenv('APP_PASSWORD', '')
+            if (os.getenv('RENDER') or cloud_host()) and len(password) < 16:
+                return self.send({'error':'Hosting password is not configured.'},503)
+            if password:
+                credentials = ''
+                try:
+                    scheme, token = self.headers.get('Authorization','').split(' ',1)
+                    if scheme.lower() == 'basic':
+                        credentials = base64.b64decode(token, validate=True).decode('utf-8')
+                except (ValueError, UnicodeError, binascii.Error): pass
+                expected = os.getenv('APP_USERNAME','scholar') + ':' + password
+                if not hmac.compare_digest(credentials.encode(), expected.encode()):
+                    return self.send({'error':'Sign in with your ScholarDesk username and password.'},401)
+            if self.command != 'GET':
+                origin = self.headers.get('Origin')
+                expected_origin = ('https://' + cloud_host()) if cloud_host() else ('http://' + host)
+                if origin and origin != expected_origin: return self.send({'error':'Origin rejected.'},403)
+                if self.headers.get('Content-Type','').split(';')[0] != 'application/json': return self.send({'error':'JSON required.'},415)
             q = {k:v[0] for k,v in urllib.parse.parse_qs(parsed.query).items()}
             body = {}
             if self.command == 'POST':
                 length = int(self.headers.get('Content-Length',0))
-                if length > 2_000_000: return self.send({'error':'Request too large.'},413)
+                if length < 0 or length > 2_000_000: return self.send({'error':'Request too large.'},413)
                 body = json.loads(self.rfile.read(length) or '{}')
-            if path == '/api/status': return self.send({'keyConfigured':bool(os.getenv('SEMANTIC_SCHOLAR_API_KEY'))})
+            if path == '/api/status': return self.send({'keyConfigured':bool(os.getenv('SEMANTIC_SCHOLAR_API_KEY')), 'hosted':bool(cloud_host())})
             if path == '/api/library':
                 with connect() as db:
                     if self.command == 'POST':
@@ -132,6 +170,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception: self.send({'error':'An unexpected server error occurred.'},500)
 
 if __name__ == '__main__':
+    validate_hosting()
     port = int(os.getenv('PORT','8000'))
-    print(f'ScholarDesk is ready at http://localhost:{port}',flush=True)
-    ThreadingHTTPServer(('127.0.0.1',port),Handler).serve_forever()
+    bind = '0.0.0.0' if cloud_host() else '127.0.0.1'
+    server = ThreadingHTTPServer((bind,port),Handler)
+    address = 'https://' + cloud_host() if cloud_host() else f'http://localhost:{port}'
+    print(f'ScholarDesk is ready at {address}',flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
